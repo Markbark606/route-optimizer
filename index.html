@@ -1,1 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Address Route Optimizer – GraphHopper</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    body { font-family: Arial, sans-serif; margin:0; padding:20px; background:#f4f4f4 }
+    #map { height:500px; width:100%; margin-top:20px; border:1px solid #ccc }
+    #error-message { display:none; background:#ffe6e6; color:#d32f2f; padding:20px; border-radius:5px; margin-bottom:20px }
+    #route-info { display:none; background:#fff; padding:20px; border-radius:5px; margin-bottom:20px; box-shadow:0 2px 5px rgba(0,0,0,0.1) }
+    #upload-section, #manual-section { background:#fff; padding:20px; border-radius:5px; margin-bottom:20px; box-shadow:0 2px 5px rgba(0,0,0,0.1) }
+    input, button { width:100%; padding:8px; margin:5px 0 }
+    button { background:#007bff; color:#fff; border:none; border-radius:5px; cursor:pointer }
+    button:hover { background:#0056b3 }
+  </style>
+</head>
+<body>
+  <h1>Address Route Optimizer – GraphHopper</h1>
+  <div id="error-message"><p id="error-text"></p></div>
+  <div id="upload-section">
+    <h2>Upload Excel File</h2>
+    <input type="file" id="excelFile" accept=".xlsx,.xls">
+    <button onclick="processFile()">Calculate Route</button>
+  </div>
+  <div id="manual-section">
+    <h2>Add Address Manually</h2>
+    <input type="text" id="manualAddress" placeholder="789 Pine St, Philadelphia, PA 19103">
+    <button onclick="addManualAddress()">Add Address</button>
+    <div id="address-list"></div>
+  </div>
+  <div id="route-info">
+    <h2>Route Details</h2>
+    <p id="total-distance"></p>
+    <p id="total-duration"></p>
+    <p id="route-order"></p>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    let map, markers = [], routeLayer, coords = [], addresses = [];
+    const GRAPHHOPPER_API_KEY = '1e9ef9af-0e29-4af8-b7c6-6b14d5afe392';
+
+    const blueDotIcon = L.divIcon({
+      className: 'blue-dot',
+      html: '<div style="background:blue; width:12px; height:12px; border-radius:50%; border:2px solid white"></div>',
+      iconSize:[16,16], iconAnchor:[8,8]
+    });
+
+    function initMap(){
+      map = L.map('map').setView([39.9526,-75.1652],12);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+        attribution:'© OpenStreetMap contributors'
+      }).addTo(map);
+    }
+    initMap();
+
+    async function addManualAddress() {
+      const input = document.getElementById('manualAddress');
+      const address = input.value.trim();
+      if (!address) return alert('Please enter a valid address.');
+      if (!address.includes(',')||!/\d/.test(address)||!/[A-Za-z]{2}\s*\d{5}/.test(address)) {
+        return alert('Enter full address: street, city, state ZIP.');
+      }
+      try {
+        let data;
+        for (let i=0;i<3;i++) {
+          const res = await fetch(`https://graphhopper.com/api/1/geocode?key=${GRAPHHOPPER_API_KEY}&q=${encodeURIComponent(address)}&limit=1`);
+          data = await res.json();
+          if (data.hits?.length) break;
+          await new Promise(r=>setTimeout(r,1000));
+        }
+        if (!data.hits?.length) return alert(`Could not geocode "${address}".`);
+        const {lat, lng} = data.hits[0].point;
+        addresses.push(address);
+        coords.push({address, latLng:[lat,lng]});
+        markers.push(
+          L.marker([lat,lng],{icon:blueDotIcon}).addTo(map).bindPopup(address)
+        );
+        map.fitBounds(markers.map(m=>m.getLatLng()));
+        updateAddressList();
+        input.value='';
+      } catch(e){ alert('Geocoding error: '+e.message) }
+    }
+
+    function updateAddressList(){
+      document.getElementById('address-list').innerHTML =
+        '<strong>Added Addresses:</strong><ul>' +
+        (addresses.length
+          ? addresses.map(a=>`<li>${a}</li>`).join('')
+          : '<li>None</li>') +
+        '</ul>';
+    }
+
+    async function processFile(){
+      const f = document.getElementById('excelFile').files[0];
+      if (!f && coords.length<2) return alert('Upload Excel or add ≥2 addresses.');
+      if (f){
+        markers.forEach(m=>m.remove());
+        if (routeLayer) routeLayer.remove();
+        markers=coords=addresses=[];
+        const r=new FileReader();
+        r.onload = async e=>{
+          const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
+          const arr=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+          for (let row of arr) if (row.Address) {
+            document.getElementById('manualAddress').value=row.Address;
+            await addManualAddress();
+          }
+          if (coords.length>=2) await calculateAndDisplayRoute(coords);
+        };
+        r.readAsArrayBuffer(f);
+      } else {
+        await calculateAndDisplayRoute(coords);
+      }
+    }
+
+    async function calculateAndDisplayRoute(coords){
+      if (routeLayer) routeLayer.remove();
+      let url=`https://graphhopper.com/api/1/route?key=${GRAPHHOPPER_API_KEY}&vehicle=car&points_encoded=false&type=json`;
+      coords.forEach(c=> {
+        url+=`&point=${c.latLng[0].toFixed(6)},${c.latLng[1].toFixed(6)}`;
+      });
+      console.log(url);
+      const res=await fetch(url), data=await res.json();
+      if (!data.paths?.length) return alert('No valid route found.');
+      const path=data.paths[0];
+      const line = L.polyline(path.points.coordinates.map(c=>[c[1],c[0]]),{color:'blue',weight:6}).addTo(map);
+      map.fitBounds(line.getBounds());
+      document.getElementById('total-distance').textContent = `Total Distance: ${(path.distance/1609.34).toFixed(2)} miles`;
+      document.getElementById('total-duration').textContent = `Total Duration: ${Math.round(path.time/1000/60)} minutes`;
+      document.getElementById('route-order').textContent = `Order: ${coords.map(c=>c.address).join(' → ')}`;
+      document.getElementById('route-info').style.display='block';
+    }
+  </script>
+</body>
+</html>
 
